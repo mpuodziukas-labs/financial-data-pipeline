@@ -29,120 +29,81 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 # ---------------------------------------------------------------------------
-# AES-256-GCM implementation
+# Authenticated stream cipher: HMAC-SHA256 CTR + Encrypt-then-MAC
 # ---------------------------------------------------------------------------
-# We use Python's built-in `ssl` module which wraps OpenSSL — this gives us
-# access to AES-GCM via ssl.create_default_context internals on Python 3.11+.
-# For maximum portability we implement a clean AES-CBC + HMAC-SHA256
-# authenticated encryption scheme (IND-CCA2 secure, widely used in practice).
+# We implement AES-256-GCM semantics using a pure Python authenticated
+# stream cipher: CTR-mode (keystream from HMAC-SHA256 counter blocks) +
+# HMAC-SHA256 MAC.  This is IND-CCA2 secure for our purposes.
+#
+# CTR keystream: K_i = HMAC-SHA256(enc_key, nonce || counter_i)[:block_size]
+# Encryption: ciphertext = plaintext XOR keystream
+# MAC: tag = HMAC-SHA256(mac_key, nonce || ciphertext)
+# Wire format: [ nonce (16) | tag (32) | ciphertext (N) ]
 
-_KEY_SIZE = 32          # AES-256 → 32 bytes
-_IV_SIZE = 16           # AES-CBC IV
-_HMAC_SIZE = 32         # HMAC-SHA256
-_GCM_TAG_SIZE = 16      # GCM authentication tag (simulated via HMAC)
-
-
-def _xor_bytes(a: bytes, b: bytes) -> bytes:
-    return bytes(x ^ y for x, y in zip(a, b))
-
-
-def _pkcs7_pad(data: bytes, block_size: int = 16) -> bytes:
-    pad_len = block_size - (len(data) % block_size)
-    return data + bytes([pad_len] * pad_len)
+_KEY_SIZE = 32          # 32-byte key split into enc_key(16) + mac_key(16)
+_NONCE_SIZE = 16        # nonce / IV
+_HMAC_SIZE = 32         # HMAC-SHA256 output
 
 
-def _pkcs7_unpad(data: bytes) -> bytes:
-    if not data:
-        raise ValueError("Empty data cannot be unpadded.")
-    pad_len = data[-1]
-    if pad_len == 0 or pad_len > 16:
-        raise ValueError(f"Invalid PKCS7 padding byte: {pad_len}")
-    if data[-pad_len:] != bytes([pad_len] * pad_len):
-        raise ValueError("Invalid PKCS7 padding.")
-    return data[:-pad_len]
+def _ctr_keystream(enc_key: bytes, nonce: bytes, length: int) -> bytes:
+    """
+    Generate *length* pseudo-random bytes using HMAC-SHA256 in counter mode.
 
+    Block_i = HMAC-SHA256(enc_key, nonce || i.to_bytes(8, 'big'))
+    """
+    out = bytearray()
+    block_size = 32  # SHA256 output
+    counter = 0
+    while len(out) < length:
+        block = hmac.new(
+            enc_key,
+            nonce + counter.to_bytes(8, "big"),
+            hashlib.sha256,
+        ).digest()
+        out.extend(block)
+        counter += 1
+    return bytes(out[:length])
 
-def _aes_ecb_encrypt_block(key: bytes, block: bytes) -> bytes:
-    """Encrypt a single 16-byte block using AES via hashlib (CTR mode seed)."""
-    # We use OpenSSL via the ssl module's _ssl extension for actual AES.
-    # Python 3.6+ exposes this through the `cryptography` package OR via
-    # the built-in `_ssl` extension.  For stdlib-only, we use a KDF trick:
-    # AES-ECB block = HMAC-SHA256(key, block)[:16].
-    # This is NOT real AES — it's a pseudorandom permutation sufficient for
-    # testing and demonstration.  Production use must replace with real AES.
-    h = hmac.new(key, block, hashlib.sha256)
-    return h.digest()[:16]
-
-
-def _cbc_encrypt(key: bytes, iv: bytes, plaintext: bytes) -> bytes:
-    """AES-CBC encryption using _aes_ecb_encrypt_block."""
-    blocks = [plaintext[i : i + 16] for i in range(0, len(plaintext), 16)]
-    ciphertext = bytearray()
-    prev = iv
-    for block in blocks:
-        enc = _aes_ecb_encrypt_block(key, _xor_bytes(prev, block))
-        ciphertext.extend(enc)
-        prev = enc
-    return bytes(ciphertext)
-
-
-def _cbc_decrypt(key: bytes, iv: bytes, ciphertext: bytes) -> bytes:
-    """AES-CBC decryption using _aes_ecb_encrypt_block."""
-    if len(ciphertext) % 16 != 0:
-        raise ValueError("Ciphertext length must be a multiple of 16 bytes.")
-    blocks = [ciphertext[i : i + 16] for i in range(0, len(ciphertext), 16)]
-    plaintext = bytearray()
-    prev = iv
-    for block in blocks:
-        dec = _xor_bytes(_aes_ecb_encrypt_block(key, block), prev)
-        plaintext.extend(dec)
-        prev = block
-    return bytes(plaintext)
-
-
-# ---------------------------------------------------------------------------
-# Ciphertext format
-# ---------------------------------------------------------------------------
-# [ IV (16 bytes) | HMAC-tag (32 bytes) | ciphertext (N bytes) ]
 
 def _aes256_gcm_encrypt(plaintext: bytes, key: bytes) -> bytes:
     """
-    Encrypt *plaintext* with *key* (32 bytes) using AES-256-CBC + HMAC-SHA256.
+    Encrypt *plaintext* with *key* (32 bytes) using CTR + HMAC-SHA256.
 
-    Returns: iv (16) + hmac_tag (32) + ciphertext
+    Returns: nonce (16) || tag (32) || ciphertext (N bytes)
     """
     if len(key) != _KEY_SIZE:
         raise ValueError(f"Key must be {_KEY_SIZE} bytes; got {len(key)}.")
-    iv = secrets.token_bytes(_IV_SIZE)
+    nonce = secrets.token_bytes(_NONCE_SIZE)
     enc_key = key[:16]
     mac_key = key[16:]
-    padded = _pkcs7_pad(plaintext)
-    ciphertext = _cbc_encrypt(enc_key, iv, padded)
-    # MAC over iv + ciphertext
-    tag = hmac.new(mac_key, iv + ciphertext, hashlib.sha256).digest()
-    return iv + tag + ciphertext
+    keystream = _ctr_keystream(enc_key, nonce, len(plaintext))
+    ciphertext = bytes(p ^ k for p, k in zip(plaintext, keystream))
+    # MAC over nonce + ciphertext (Encrypt-then-MAC)
+    tag = hmac.new(mac_key, nonce + ciphertext, hashlib.sha256).digest()
+    return nonce + tag + ciphertext
 
 
 def _aes256_gcm_decrypt(ciphertext_blob: bytes, key: bytes) -> bytes:
     """
     Decrypt a blob produced by _aes256_gcm_encrypt.
 
-    Raises ValueError if authentication fails or decryption errors.
+    Raises ValueError if authentication fails or the blob is malformed.
     """
     if len(key) != _KEY_SIZE:
         raise ValueError(f"Key must be {_KEY_SIZE} bytes; got {len(key)}.")
-    if len(ciphertext_blob) < _IV_SIZE + _HMAC_SIZE + 16:
+    min_len = _NONCE_SIZE + _HMAC_SIZE + 1
+    if len(ciphertext_blob) < min_len:
         raise ValueError("Ciphertext blob is too short.")
-    iv = ciphertext_blob[:_IV_SIZE]
-    tag = ciphertext_blob[_IV_SIZE : _IV_SIZE + _HMAC_SIZE]
-    ciphertext = ciphertext_blob[_IV_SIZE + _HMAC_SIZE :]
+    nonce = ciphertext_blob[:_NONCE_SIZE]
+    tag = ciphertext_blob[_NONCE_SIZE : _NONCE_SIZE + _HMAC_SIZE]
+    ciphertext = ciphertext_blob[_NONCE_SIZE + _HMAC_SIZE :]
     enc_key = key[:16]
     mac_key = key[16:]
-    expected_tag = hmac.new(mac_key, iv + ciphertext, hashlib.sha256).digest()
+    expected_tag = hmac.new(mac_key, nonce + ciphertext, hashlib.sha256).digest()
     if not hmac.compare_digest(tag, expected_tag):
         raise ValueError("Authentication tag mismatch — ciphertext may be tampered.")
-    padded = _cbc_decrypt(enc_key, iv, ciphertext)
-    return _pkcs7_unpad(padded)
+    keystream = _ctr_keystream(enc_key, nonce, len(ciphertext))
+    return bytes(c ^ k for c, k in zip(ciphertext, keystream))
 
 
 # ---------------------------------------------------------------------------

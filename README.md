@@ -1,5 +1,8 @@
 # plaid-data-pipeline
 
+> Third-party toolkit wrapping Plaid's public API. Not affiliated with Plaid, Inc.
+
+
 Production-grade Plaid API client, Delta Writer, and PII Vault — all in pure Python stdlib.
 
 ## Modules
@@ -29,7 +32,7 @@ vault = PiiVault()
 key = PiiVault.generate_key()
 encrypted = vault.encrypt_field("sensitive data", key)
 decrypted = vault.decrypt_field(encrypted, key)
-token = vault.tokenize_ssn("123-45-6789")
+token = vault.tokenize_ssn("<SSN>")
 vault.audit_log("encrypt", "ssn", "data_pipeline_svc")
 ```
 
